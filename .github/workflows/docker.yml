@@ -1,0 +1,205 @@
+name: Build and Publish Docker Images
+
+# Multi-arch Docker image build & publish to ghcr.io:
+#   - linux/amd64 on ubuntu-latest
+#   - linux/arm64 on ubuntu-24.04-arm (native ARM runner, no QEMU)
+# Binaries are cross-compiled with musl on the host (same as scripts/release.sh);
+# Dockerfiles do NOT compile Rust in-container.
+#
+# Pushed tags (on tag push vX.Y.Z):
+#   ghcr.io/givenge/reader-rust:vX.Y.Z           multi-arch manifest (amd64 + arm64)
+#   ghcr.io/givenge/reader-rust:latest           multi-arch manifest (amd64 + arm64)
+#   ghcr.io/givenge/reader-rust:vX.Y.Z-x86_64    amd64 only
+#   ghcr.io/givenge/reader-rust:vX.Y.Z-aarch64   arm64 only
+#   ghcr.io/givenge/reader-rust:latest-aarch64   arm64 only (rolling)
+#
+# Auth uses the built-in GITHUB_TOKEN (permissions: packages: write) — no extra secrets needed.
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - master
+      - main
+    paths:
+      - 'src/**'
+      - 'frontend/src/**'
+      - 'frontend/public/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - 'Dockerfile.x86'
+      - '.github/workflows/docker.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            arch_tag: x86_64
+            musl_linker: x86_64-linux-musl-gcc
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch_tag: aarch64
+            musl_linker: aarch64-linux-musl-gcc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          # .cargo/config.toml expects a triple-prefixed musl linker
+          sudo ln -sf "$(command -v musl-gcc)" "/usr/local/bin/${{ matrix.musl_linker }}"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build Rust binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Docker meta
+        id: meta
+        run: |
+          # vX.Y.Z -> X.Y.Z, or fall back to commit sha on branch builds
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            VERSION="sha-${GITHUB_SHA::8}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "ref=${GITHUB_REF_TYPE}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          # Dockerfile picks the binary path by TARGETARCH
+          build-args: |
+            TARGETARCH=${{ matrix.arch_tag }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=${{ github.ref_type == 'tag' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.arch_tag }}
+          cache-to: type=gha,scope=${{ matrix.arch_tag }},mode=max
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch_tag }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Push arch-specific tags (tag builds only)
+        if: steps.meta.outputs.ref == 'tag' && github.ref_type == 'tag'
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ steps.meta.outputs.version }}-${{ matrix.arch_tag }}" \
+            "${IMAGE}@${{ steps.build.outputs.digest }}"
+
+  merge:
+    name: Merge multi-arch manifest
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine version
+        id: meta
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            VERSION="sha-${GITHUB_SHA::8}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ steps.meta.outputs.version }}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Update rolling latest tags
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:latest" \
+            -t "${IMAGE}:latest-aarch64" \
+            "${IMAGE}:${{ steps.meta.outputs.version }}"
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect "${IMAGE}:${{ steps.meta.outputs.version }}"

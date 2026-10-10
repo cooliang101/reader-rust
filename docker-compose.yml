@@ -1,0 +1,52 @@
+# Example docker-compose for reader-rust
+#
+# Usage:
+#   docker compose up -d
+#
+# Configuration:
+#   Environment variables can be set in a `.env` file next to this compose file:
+#     cp .env.example .env   # then edit .env
+#   Compose automatically loads `.env` for ${VAR} interpolation below.
+#   Values in `environment:` below override `.env` — they are commented out by
+#   default so `.env` takes effect.
+#
+# Image tags:
+#   latest           -> multi-arch manifest (amd64 + arm64, auto-selects)
+#   latest-aarch64   -> arm64 only
+#   vX.Y.Z           -> multi-arch manifest for a released version
+#
+# On arm devices (e.g. Raspberry Pi 4/5, Apple Silicon) `latest` works directly.
+
+services:
+  reader-rust:
+    image: ghcr.io/givenge/reader-rust:latest
+    container_name: reader-rust
+    restart: unless-stopped
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    volumes:
+      # Persistent SQLite database & downloaded assets
+      - ./storage:/app/storage
+    environment:
+      # Leave these commented to use values from `.env`;
+      # uncomment to override per-deployment.
+      # SERVER_HOST: 0.0.0.0
+      # SERVER_PORT: 8080
+      # DATABASE_URL: "sqlite:/app/storage/reader.db?mode=rwc"
+      # STORAGE_DIR: /app/storage
+      # ASSETS_DIR: /app/storage/assets
+      # WEB_ROOT: /app/web/dist
+      # LOG_LEVEL: info
+      # Security mode & registration gate
+      # SECURE: "true"
+      # SECURE_KEY: "change-me-to-a-random-string"
+      # INVITE_CODE: "change-me"
+      # Limits
+      # USER_LIMIT: "50"
+      # USER_BOOK_LIMIT: "2000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
